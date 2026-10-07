@@ -1,0 +1,11 @@
+*.exe
+*.o
+*.obj
+*.pdb
+build/
+.vscode/
+.DS_Store
+Thumbs.db
+last_heartbeat.txt
+src/membomb
+src/membomb_raw

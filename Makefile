@@ -1,16 +1,14 @@
 CC = gcc
-CFLAGS = -Wall -O2
+CFLAGS = -Wall -Wextra -O2
 SRC = src/membomb.c
+OUT = src/membomb
 
 .PHONY: all clean
 
-all: src/membomb src/membomb_raw
+all: $(OUT)
 
-src/membomb: $(SRC)
+$(OUT): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
-src/membomb_raw: $(SRC)
-	$(CC) $(CFLAGS) -DMEMBOMB_RAW -o $@ $(SRC)
-
 clean:
-	rm -f src/membomb src/membomb.exe src/membomb_raw src/membomb_raw.exe
+	rm -f $(OUT) $(OUT).exe

@@ -9,3 +9,7 @@ Thumbs.db
 last_heartbeat.txt
 src/membomb
 src/membomb_raw
+/free_memory.csv
+/free_memory.svg
+last_moments*.csv
+last_moments*.svg

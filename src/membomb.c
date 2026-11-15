@@ -1,7 +1,15 @@
+/*
+ * MemBomb — учебная демонстрация выделения памяти до мягкого лимита.
+ * Пётр Калинкин, Университет ИТМО.
+ *
+ * По умолчанию режим SAFE: программа берёт не больше DEFAULT_SOFT_MB
+ * и никогда не больше HARD_CAP_MB. Безлимитного режима нет.
+ * Запускать только в изолированной виртуальной машине.
+ * Память освобождается до выхода. ulimit и cgroups программа не обходит.
+ */
 #ifndef _WIN32
 #define _GNU_SOURCE
 #endif
-#define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
 #include <signal.h>
@@ -10,24 +18,15 @@
 #include <string.h>
 #include <time.h>
 
-#define MAX_SAMPLES 16384
-#define DEFAULT_SAFE_MB 1024
-#define DEFAULT_CHUNK_MB 4
-#define DEFAULT_STAGGER_MS 10
-#define BASELINE_MS 1500
-#define HOLD_MS 2000
-#define TAIL_MS 2000
-#define INTERVAL_MS 100
-#define CRASH_BASELINE_MS 400
-#define CRASH_INTERVAL_MS 50
-#define CRASH_LOG "last_moments.csv"
-#define CRASH_SVG "last_moments.svg"
-#define HEARTBEAT "last_heartbeat.txt"
-#ifdef MEMBOMB_RAW
-#define NO_FILES 1
-#else
-#define NO_FILES 0
-#endif
+#define HARD_CAP_MB 256u
+#define DEFAULT_SOFT_MB 64u
+#define DEFAULT_CHUNK_MB 4u
+#define DEFAULT_STAGGER_MS 20u
+#define MAX_SAMPLES 4096
+#define BASELINE_MS 800u
+#define HOLD_MS 1000u
+#define TAIL_MS 800u
+#define INTERVAL_MS 100u
 
 typedef struct {
     void *p;
@@ -48,17 +47,12 @@ static size_t g_nchunks;
 static size_t g_cap;
 static unsigned long long g_allocated;
 static size_t g_page;
-static FILE *g_log;
-static volatile int g_stop;
-static int g_persist_ok = 1;
-static const char *g_chart_title = "free memory";
+static volatile sig_atomic_t g_stop;
 
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <io.h>
-#include <fcntl.h>
 
 static double monotonic_sec(void)
 {
@@ -82,22 +76,15 @@ static size_t page_size(void)
     return (size_t)si.dwPageSize;
 }
 
-static unsigned long long phys_total_bytes(void)
+static unsigned long long mem_kb_field(int which)
 {
     MEMORYSTATUSEX s;
     s.dwLength = sizeof(s);
     if (!GlobalMemoryStatusEx(&s))
         return 0;
-    return s.ullTotalPhys;
-}
-
-static unsigned long long phys_free_bytes(void)
-{
-    MEMORYSTATUSEX s;
-    s.dwLength = sizeof(s);
-    if (!GlobalMemoryStatusEx(&s))
-        return 0;
-    return s.ullAvailPhys;
+    if (which == 0)
+        return s.ullTotalPhys / 1024ull;
+    return s.ullAvailPhys / 1024ull;
 }
 
 static void *alloc_chunk(size_t n)
@@ -112,34 +99,12 @@ static void free_chunk(void *p, size_t n)
         VirtualFree(p, 0, MEM_RELEASE);
 }
 
-static void print_alloc_fail(size_t tried)
+static void print_alloc_fail(void)
 {
-    (void)tried;
-    printf("VirtualAlloc failed (%lu)\n", (unsigned long)GetLastError());
-}
-
-static int set_memory_quota_mb(unsigned mb)
-{
-    HANDLE job;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION lim;
-    job = CreateJobObjectA(NULL, NULL);
-    if (!job)
-        return -1;
-    memset(&lim, 0, sizeof(lim));
-    lim.ProcessMemoryLimit = (SIZE_T)mb * 1024ull * 1024ull;
-    lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &lim, sizeof(lim)))
-        return -1;
-    if (!AssignProcessToJobObject(job, GetCurrentProcess()))
-        return -1;
-    return 0;
-}
-
-static void harden_flush(FILE *f)
-{
-    fflush(f);
-    if (f)
-        FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
+    fprintf(stderr,
+            "VirtualAlloc не удался, GetLastError=%lu.\n"
+            "Лимит ОС (commit charge или квота задания) сработал раньше HARD_CAP.\n",
+            (unsigned long)GetLastError());
 }
 
 static BOOL WINAPI on_console_ctrl(DWORD ev)
@@ -149,6 +114,11 @@ static BOOL WINAPI on_console_ctrl(DWORD ev)
         return TRUE;
     }
     return FALSE;
+}
+
+static void install_stop_handlers(void)
+{
+    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
 }
 
 #else
@@ -182,7 +152,8 @@ static size_t page_size(void)
 static unsigned long long meminfo_kb(const char *key)
 {
     FILE *f = fopen("/proc/meminfo", "r");
-    char line[256], name[64];
+    char line[256];
+    char name[64];
     unsigned long long val;
     if (!f)
         return 0;
@@ -196,17 +167,13 @@ static unsigned long long meminfo_kb(const char *key)
     return 0;
 }
 
-static unsigned long long phys_total_bytes(void)
+static unsigned long long mem_kb_field(int which)
 {
-    return meminfo_kb("MemTotal:") * 1024ull;
-}
-
-static unsigned long long phys_free_bytes(void)
-{
-    unsigned long long avail = meminfo_kb("MemAvailable:");
-    if (avail)
-        return avail * 1024ull;
-    return meminfo_kb("MemFree:") * 1024ull;
+    if (which == 0)
+        return meminfo_kb("MemTotal:");
+    if (meminfo_kb("MemAvailable:"))
+        return meminfo_kb("MemAvailable:");
+    return meminfo_kb("MemFree:");
 }
 
 static void *alloc_chunk(size_t n)
@@ -226,29 +193,24 @@ static void free_chunk(void *p, size_t n)
         munmap(p, n);
 }
 
-static void print_alloc_fail(size_t tried)
+static void print_alloc_fail(void)
 {
-    (void)tried;
-    perror("mmap");
-}
-
-static int set_memory_quota_mb(unsigned mb)
-{
-    (void)mb;
-    return -1;
-}
-
-static void harden_flush(FILE *f)
-{
-    fflush(f);
-    if (f)
-        fsync(fileno(f));
+    fprintf(stderr,
+            "mmap не удался: %s.\n"
+            "Лимит ОС (ulimit -v или cgroup memory.max) сработал раньше HARD_CAP.\n",
+            strerror(errno));
 }
 
 static void on_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
+}
+
+static void install_stop_handlers(void)
+{
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
 }
 
 #endif
@@ -258,18 +220,25 @@ static double bytes_mb(unsigned long long n)
     return (double)n / (1024.0 * 1024.0);
 }
 
+static size_t align_down_page(size_t n)
+{
+    if (g_page == 0)
+        return 0;
+    return (n / g_page) * g_page;
+}
+
 static void touch_pages(void *mem, size_t n)
 {
-    unsigned char *p = (unsigned char *)mem;
+    volatile unsigned char *p = (volatile unsigned char *)mem;
     size_t i;
     for (i = 0; i < n; i += g_page)
-        *(volatile unsigned char *)(p + i) = 0;
+        p[i] = 1;
 }
 
 static int keep_chunk(void *p, size_t n)
 {
     if (g_nchunks >= g_cap) {
-        size_t ncap = g_cap ? g_cap * 2 : 64;
+        size_t ncap = g_cap ? g_cap * 2 : 16;
         Chunk *nw = (Chunk *)realloc(g_chunks, ncap * sizeof(Chunk));
         if (!nw)
             return -1;
@@ -288,124 +257,36 @@ static void record(void)
     if (g_nsamples >= MAX_SAMPLES)
         return;
     g_samples[g_nsamples].t_sec = monotonic_sec() - g_t0;
-    g_samples[g_nsamples].free_mb = bytes_mb(phys_free_bytes());
+    g_samples[g_nsamples].free_mb = bytes_mb(mem_kb_field(1) * 1024ull);
     g_samples[g_nsamples].allocated_mb = bytes_mb(g_allocated);
     g_nsamples++;
 }
 
-static int persist_last(int durable)
+static void sample_for(unsigned ms)
 {
-    FILE *hb;
-    const Sample *s;
-    if (NO_FILES)
-        return 0;
-    if (g_nsamples < 1)
-        return 0;
-    s = &g_samples[g_nsamples - 1];
-    if (g_log) {
-        if (fprintf(g_log, "%.3f,%.2f,%.2f\n", s->t_sec, s->free_mb, s->allocated_mb) < 0) {
-            g_persist_ok = 0;
-            return -1;
-        }
-        if (durable)
-            harden_flush(g_log);
-        else
-            fflush(g_log);
-    }
-    hb = fopen(HEARTBEAT, "w");
-    if (hb) {
-        fprintf(hb, "t_sec=%.3f free_mb=%.2f allocated_mb=%.2f chunks=%zu persist=%s\n",
-                s->t_sec, s->free_mb, s->allocated_mb, g_nchunks,
-                g_persist_ok ? "ok" : "fail");
-        if (durable)
-            harden_flush(hb);
-        else
-            fflush(hb);
-        fclose(hb);
-    }
-    return 0;
-}
-
-static void sample_now(int durable)
-{
-    record();
-    persist_last(durable);
-}
-
-static void sample_for(unsigned ms, unsigned interval_ms, int durable)
-{
-    double until = monotonic_sec() + ms / 1000.0;
+    double until = monotonic_sec() + (double)ms / 1000.0;
     do {
-        sample_now(durable);
-        sleep_ms(interval_ms);
+        record();
+        if (g_stop)
+            break;
+        sleep_ms(INTERVAL_MS);
     } while (!g_stop && monotonic_sec() < until);
-}
-
-static size_t align_page(size_t n)
-{
-    if (n < g_page)
-        return g_page;
-    return (n / g_page) * g_page;
-}
-
-static size_t next_chunk(size_t last, int fixed_mb)
-{
-    size_t c;
-    if (last == 0) {
-        if (fixed_mb > 0)
-            c = (size_t)fixed_mb * 1024ull * 1024ull;
-        else
-            c = g_page;
-    } else if (last > (size_t)-1 / 2) {
-        c = last;
-    } else {
-        c = last * 2;
-    }
-    return align_page(c);
 }
 
 static void write_csv(const char *path)
 {
     FILE *f = fopen(path, "w");
     int i;
-    if (!f)
+    if (!f) {
+        perror(path);
         return;
+    }
     fprintf(f, "t_sec,free_mb,allocated_mb\n");
-    for (i = 0; i < g_nsamples; i++)
+    for (i = 0; i < g_nsamples; i++) {
         fprintf(f, "%.3f,%.2f,%.2f\n",
                 g_samples[i].t_sec, g_samples[i].free_mb, g_samples[i].allocated_mb);
-    fclose(f);
-}
-
-static int load_csv(const char *path)
-{
-    FILE *f = fopen(path, "r");
-    char line[256];
-    Sample all[MAX_SAMPLES];
-    int n = 0, i;
-    if (!f)
-        return -1;
-    g_nsamples = 0;
-    while (fgets(line, sizeof(line), f)) {
-        Sample s;
-        if (line[0] == '#' || strncmp(line, "t_sec", 5) == 0)
-            continue;
-        if (sscanf(line, "%lf,%lf,%lf", &s.t_sec, &s.free_mb, &s.allocated_mb) != 3)
-            continue;
-        if (n < MAX_SAMPLES)
-            all[n++] = s;
-        else {
-            memmove(all + 200, all + 201, (MAX_SAMPLES - 201) * sizeof(Sample));
-            all[MAX_SAMPLES - 1] = s;
-        }
     }
     fclose(f);
-    if (n < 1)
-        return -1;
-    for (i = 0; i < n; i++)
-        g_samples[i] = all[i];
-    g_nsamples = n;
-    return 0;
 }
 
 static void ticks(double lo, double hi, int n, double *out)
@@ -418,7 +299,7 @@ static void ticks(double lo, double hi, int n, double *out)
     }
     step = (hi - lo) / (double)(n - 1);
     for (i = 0; i < n; i++)
-        out[i] = lo + step * i;
+        out[i] = lo + step * (double)i;
 }
 
 static void write_svg(const char *path)
@@ -435,22 +316,24 @@ static void write_svg(const char *path)
         return;
     x_min = g_samples[0].t_sec;
     x_max = g_samples[g_nsamples - 1].t_sec;
-    if (x_max == x_min)
+    if (x_max <= x_min)
         x_max = x_min + 1.0;
-    y_min = y_max = g_samples[0].free_mb;
+    y_min = y_max = g_samples[0].allocated_mb;
     for (i = 1; i < g_nsamples; i++) {
-        if (g_samples[i].free_mb < y_min)
-            y_min = g_samples[i].free_mb;
-        if (g_samples[i].free_mb > y_max)
-            y_max = g_samples[i].free_mb;
+        if (g_samples[i].allocated_mb < y_min)
+            y_min = g_samples[i].allocated_mb;
+        if (g_samples[i].allocated_mb > y_max)
+            y_max = g_samples[i].allocated_mb;
     }
     pad = (y_max - y_min) * 0.08;
-    if (pad < 8)
-        pad = 8;
+    if (pad < 1.0)
+        pad = 1.0;
     y_min -= pad;
     if (y_min < 0)
         y_min = 0;
     y_max += pad;
+    if (y_max <= y_min)
+        y_max = y_min + 1.0;
     ticks(x_min, x_max, 6, xt);
     ticks(y_min, y_max, 6, yt);
     fprintf(f,
@@ -464,9 +347,9 @@ static void write_svg(const char *path)
             "    .frame { stroke: #333; fill: none; }\n"
             "    .series { fill: none; stroke: #1d4ed8; stroke-width: 2; }\n"
             "  </style>\n"
-            "  <text class=\"title\" x=\"88\" y=\"28\">%s</text>\n"
-            "  <text class=\"caption\" x=\"88\" y=\"46\">%s</text>\n",
-            g_chart_title, path);
+            "  <text class=\"title\" x=\"88\" y=\"28\">Память, затронутая процессом</text>\n"
+            "  <text class=\"caption\" x=\"88\" y=\"46\">учебный прогон, потолок HARD_CAP %u МиБ</text>\n",
+            HARD_CAP_MB);
     for (i = 0; i < 6; i++) {
         double gy = top + height - (yt[i] - y_min) / (y_max - y_min) * height;
         double gx = left + (xt[i] - x_min) / (x_max - x_min) * width;
@@ -484,296 +367,263 @@ static void write_svg(const char *path)
     fprintf(f, "  <polyline class=\"series\" points=\"");
     for (i = 0; i < g_nsamples; i++) {
         double sx = left + (g_samples[i].t_sec - x_min) / (x_max - x_min) * width;
-        double sy = top + height - (g_samples[i].free_mb - y_min) / (y_max - y_min) * height;
+        double sy = top + height - (g_samples[i].allocated_mb - y_min) / (y_max - y_min) * height;
         fprintf(f, "%.1f,%.1f ", sx, sy);
     }
     fprintf(f, "\" />\n");
-    fprintf(f, "  <text x=\"%.1f\" y=\"455\" text-anchor=\"middle\">t, s</text>\n",
-            left + width / 2);
+    fprintf(f, "  <text x=\"%.1f\" y=\"455\" text-anchor=\"middle\">t, s</text>\n", left + width / 2.0);
     fprintf(f,
-            "  <text x=\"22\" y=\"%.1f\" text-anchor=\"middle\" transform=\"rotate(-90 22 %.1f)\">MB</text>\n"
+            "  <text x=\"22\" y=\"%.1f\" text-anchor=\"middle\" transform=\"rotate(-90 22 %.1f)\">МиБ</text>\n"
             "</svg>\n",
-            top + height / 2, top + height / 2);
+            top + height / 2.0, top + height / 2.0);
     fclose(f);
-}
-
-static int file_exists(const char *path)
-{
-    FILE *f = fopen(path, "r");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
-}
-
-static void archive_previous_crash(void)
-{
-    char name[160];
-    time_t now;
-    struct tm *tmv;
-    if (NO_FILES || !file_exists(CRASH_LOG))
-        return;
-    now = time(NULL);
-    tmv = localtime(&now);
-    if (!tmv || strftime(name, sizeof(name), "last_moments_%Y%m%d_%H%M%S.csv", tmv) == 0)
-        snprintf(name, sizeof(name), "last_moments_prev.csv");
-    if (rename(CRASH_LOG, name) != 0)
-        return;
-    if (load_csv(name) == 0)
-        write_svg(CRASH_SVG);
-    g_nsamples = 0;
 }
 
 static void release_all(unsigned stagger_ms)
 {
-    size_t i = g_nchunks;
-    while (i > 0) {
-        i--;
-        free_chunk(g_chunks[i].p, g_chunks[i].size);
-        g_allocated -= g_chunks[i].size;
+    while (g_nchunks > 0) {
+        size_t i = g_nchunks - 1;
+        size_t n = g_chunks[i].size;
+        free_chunk(g_chunks[i].p, n);
         g_chunks[i].p = NULL;
+        if (g_allocated >= n)
+            g_allocated -= n;
+        else
+            g_allocated = 0;
+        g_nchunks--;
         record();
-        if (stagger_ms)
+        if (stagger_ms && !g_stop)
             sleep_ms(stagger_ms);
     }
-    g_nchunks = 0;
 }
 
-static void install_stop_handlers(void)
+static void print_banner(unsigned requested_mb, unsigned effective_mb, unsigned chunk_mb, unsigned stagger_ms)
 {
-#ifdef _WIN32
-    SetConsoleCtrlHandler(on_console_ctrl, TRUE);
-#else
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
-#endif
+    unsigned long long total_kb = mem_kb_field(0);
+    unsigned long long avail_kb = mem_kb_field(1);
+    printf("=== MemBomb: учебная демонстрация исчерпания памяти ===\n");
+    printf("Только изолированная ВМ. Это не инструмент атаки.\n");
+    printf("Режим SAFE (единственный). HARD_CAP = %u МиБ, флагом не поднимается.\n", HARD_CAP_MB);
+    printf("Запрошено %u МиБ, к выделению %u МиБ, кусок %u МиБ, пауза %u мс.\n",
+           requested_mb, effective_mb, chunk_mb, stagger_ms);
+    if (total_kb)
+        printf("Сейчас в ОС: всего %.0f МиБ, доступно %.0f МиБ.\n",
+               bytes_mb(total_kb * 1024ull), bytes_mb(avail_kb * 1024ull));
+    printf("Страницы будут затронуты записью, затем вся память освобождается.\n");
+    printf("Ctrl+C прерывает цикл и тоже освобождает память.\n\n");
+    fflush(stdout);
 }
 
-static int open_crash_log(unsigned long long total, unsigned long long avail)
+static void usage(FILE *fp)
 {
-    (void)total;
-    (void)avail;
-    if (NO_FILES)
-        return 0;
-    g_log = fopen(CRASH_LOG, "w");
-    if (!g_log)
+    fprintf(fp,
+            "Использование: membomb [-m МИБ] [-c МИБ] [-s МС] [-h]\n"
+            "\n"
+            "Учебный прогон в своём процессе. Безлимитного режима нет.\n"
+            "  -m МИБ   мягкий лимит (по умолчанию %u, потолок HARD_CAP %u)\n"
+            "  -c МИБ   размер одного куска (по умолчанию %u)\n"
+            "  -s МС    пауза между кусками, миллисекунды (по умолчанию %u, 0 допустим)\n"
+            "  -h       эта справка\n"
+            "\n"
+            "Значение -m выше HARD_CAP обрезается. -m 0 отклоняется.\n"
+            "Дополнительно программа не берёт больше половины доступной памяти.\n"
+            "Если mmap/VirtualAlloc вернёт ошибку, цикл останавливается сразу:\n"
+            "кусок не уменьшается, чтобы «дожать» машину.\n"
+            "Запускать только в изолированной ВМ. Защита: ulimit -v и cgroup memory.max.\n",
+            DEFAULT_SOFT_MB, HARD_CAP_MB, DEFAULT_CHUNK_MB, DEFAULT_STAGGER_MS);
+}
+
+static int parse_u(const char *s, unsigned *out)
+{
+    char *end = NULL;
+    unsigned long v;
+    if (!s || !*s)
         return -1;
-#if defined(_WIN32)
-    setvbuf(g_log, NULL, _IONBF, 0);
-#else
-    setvbuf(g_log, NULL, _IOLBF, 0);
-#endif
-    fprintf(g_log, "t_sec,free_mb,allocated_mb\n");
+    errno = 0;
+    v = strtoul(s, &end, 10);
+    if (errno || end == s || *end)
+        return -1;
+    if (v > 1000000ul)
+        return -1;
+    *out = (unsigned)v;
     return 0;
 }
 
-static void close_crash_log(void)
+static unsigned clamp_effective(unsigned requested_mb)
 {
-    if (!g_log)
-        return;
-    harden_flush(g_log);
-    fclose(g_log);
-    g_log = NULL;
-}
+    unsigned effective = requested_mb;
+    unsigned long long avail_kb;
+    unsigned half_mb;
 
-static void deathwatch(unsigned ms)
-{
-    sample_for(ms, 40, 1);
-}
-
-static int run_crash(int chunk_mb, unsigned stagger_ms, unsigned quota_mb)
-{
-    unsigned long long total = phys_total_bytes();
-    unsigned long long avail = phys_free_bytes();
-    size_t this_chunk;
-    int failed = 0;
-    unsigned long long n = 0;
-
-    archive_previous_crash();
-    if (open_crash_log(total, avail) != 0)
-        return 1;
-
-    if (quota_mb) {
-        if (set_memory_quota_mb(quota_mb) != 0) {
-            close_crash_log();
-            return 1;
+    if (effective > HARD_CAP_MB) {
+        fprintf(stderr, "Запрошено %u МиБ, обрезано до HARD_CAP (%u МиБ).\n", requested_mb, HARD_CAP_MB);
+        effective = HARD_CAP_MB;
+    }
+    avail_kb = mem_kb_field(1);
+    if (avail_kb > 0) {
+        if (avail_kb / 2ull < 1024ull) {
+            fprintf(stderr,
+                    "Доступно %.1f МиБ. Для прогона нужно хотя бы около 2 МиБ свободных. Останов.\n",
+                    bytes_mb(avail_kb * 1024ull));
+            return 0;
         }
+        half_mb = (unsigned)((avail_kb / 2ull) / 1024ull);
+        if (effective > half_mb) {
+            fprintf(stderr,
+                    "Доступно %.0f МиБ. Чтобы не давить машину, лимит снижен до половины: %u МиБ.\n",
+                    bytes_mb(avail_kb * 1024ull), half_mb);
+            effective = half_mb;
+        }
+    }
+    if (effective > HARD_CAP_MB)
+        effective = HARD_CAP_MB;
+    return effective;
+}
+
+static int run_bounded(unsigned effective_mb, unsigned chunk_mb, unsigned stagger_ms)
+{
+    unsigned long long limit_bytes;
+    size_t chunk;
+    int os_stopped = 0;
+    int rc = 0;
+
+    limit_bytes = (unsigned long long)effective_mb * 1024ull * 1024ull;
+    chunk = (size_t)chunk_mb * 1024ull * 1024ull;
+    if (chunk % g_page)
+        chunk = (chunk / g_page + 1) * g_page;
+    if (chunk < g_page)
+        chunk = g_page;
+    if ((unsigned long long)chunk > limit_bytes)
+        chunk = align_down_page((size_t)limit_bytes);
+    if (chunk < g_page) {
+        fprintf(stderr, "Лимит меньше одной страницы (%zu байт). Останов.\n", g_page);
+        return 1;
     }
 
     g_t0 = monotonic_sec();
-    if (!NO_FILES)
-        sample_for(CRASH_BASELINE_MS, CRASH_INTERVAL_MS, 1);
+    sample_for(BASELINE_MS);
 
-    this_chunk = next_chunk(0, chunk_mb);
-    while (!g_stop) {
-        unsigned long long free_now = phys_free_bytes();
-        int durable;
+    while (!g_stop && g_allocated < limit_bytes) {
+        size_t n = chunk;
         void *p;
-        p = alloc_chunk(this_chunk);
-        if (!p && this_chunk > g_page) {
-            this_chunk = align_page(this_chunk / 2);
-            continue;
-        }
+        unsigned long long room = limit_bytes - g_allocated;
+        if ((unsigned long long)n > room)
+            n = align_down_page((size_t)room);
+        if (n < g_page)
+            break;
+        p = alloc_chunk(n);
         if (!p) {
-            print_alloc_fail(this_chunk);
-            failed = 1;
+            print_alloc_fail();
+            os_stopped = 1;
             break;
         }
-        touch_pages(p, this_chunk);
-        if (keep_chunk(p, this_chunk) != 0) {
-            free_chunk(p, this_chunk);
-            failed = 1;
+        touch_pages(p, n);
+        if (keep_chunk(p, n) != 0) {
+            free_chunk(p, n);
+            fprintf(stderr, "Не хватило памяти на таблицу кусков. Останов.\n");
+            os_stopped = 1;
             break;
         }
-        durable = (free_now < 256ull * 1024ull * 1024ull) || ((n & 7ull) == 0);
-        sample_now(durable);
-        n++;
-        this_chunk = next_chunk(this_chunk, 0);
+        record();
+        printf("выделено %7.2f МиБ\n", bytes_mb(g_allocated));
+        fflush(stdout);
         if (stagger_ms)
             sleep_ms(stagger_ms);
-        if (!g_persist_ok)
-            break;
     }
-
-    if (!NO_FILES && !g_stop)
-        deathwatch(failed ? 8000 : 4000);
-
-    if (!NO_FILES) {
-        write_svg(CRASH_SVG);
-        close_crash_log();
-    } else if (failed) {
-        while (!g_stop)
-            sleep_ms(1000);
-    }
-    return failed ? 2 : 0;
-}
-
-static int run_safe(unsigned long long max_bytes, size_t chunk, unsigned stagger_ms, unsigned quota_mb)
-{
-    int failed = 0;
-
-    if (quota_mb) {
-        if (set_memory_quota_mb(quota_mb) != 0)
-            return 1;
-        if (max_bytes == 0 || max_bytes > (unsigned long long)quota_mb * 1024ull * 1024ull)
-            max_bytes = 0;
-    }
-
-    g_t0 = monotonic_sec();
-    sample_for(BASELINE_MS, INTERVAL_MS, 0);
 
     {
-        size_t this_chunk = next_chunk(0, 0);
-        if (chunk > g_page)
-            this_chunk = align_page(chunk);
-        for (;;) {
-            void *p;
-            if (g_stop)
-                break;
-            if (max_bytes > 0) {
-                if (g_allocated >= max_bytes)
-                    break;
-                if (g_allocated + this_chunk > max_bytes)
-                    this_chunk = align_page((size_t)(max_bytes - g_allocated));
-                if (this_chunk < g_page || g_allocated + this_chunk > max_bytes)
-                    break;
-            }
-            p = alloc_chunk(this_chunk);
-            if (!p && this_chunk > g_page) {
-                this_chunk = align_page(this_chunk / 2);
-                continue;
-            }
-            if (!p) {
-                print_alloc_fail(this_chunk);
-                failed = 1;
-                break;
-            }
-            touch_pages(p, this_chunk);
-            if (keep_chunk(p, this_chunk) != 0) {
-                free_chunk(p, this_chunk);
-                failed = 1;
-                break;
-            }
-            record();
-            this_chunk = next_chunk(this_chunk, 0);
-            if (stagger_ms)
-                sleep_ms(stagger_ms);
-        }
-    }
+        unsigned long long peak = g_allocated;
+        if (!g_stop && !os_stopped)
+            sample_for(HOLD_MS);
+        release_all(g_stop ? 0u : stagger_ms);
+        if (!g_stop)
+            sample_for(TAIL_MS);
 
-    sample_for(HOLD_MS, INTERVAL_MS, 0);
-    release_all(stagger_ms);
-    sample_for(TAIL_MS, INTERVAL_MS, 0);
-    if (!NO_FILES) {
-        g_chart_title = "free memory";
         write_csv("free_memory.csv");
         write_svg("free_memory.svg");
+
+        printf("\nИтог: потолок этого прогона %u МиБ, затронуто %.2f МиБ, после освобождения осталось %.2f МиБ.\n",
+               effective_mb, bytes_mb(peak), bytes_mb(g_allocated));
     }
-    return failed ? 2 : 0;
+    if (g_stop) {
+        printf("Прервано сигналом. Память освобождена.\n");
+        rc = 130;
+    } else if (os_stopped) {
+        printf("До мягкого лимита не дошли: остановил отказ ОС. Память освобождена.\n");
+        rc = 2;
+    } else {
+        printf("Мягкий лимит достигнут штатно. Память освобождена.\n");
+        rc = 0;
+    }
+    printf("Ряд: free_memory.csv, график: free_memory.svg (в текущем каталоге).\n");
+    return rc;
 }
 
 int main(int argc, char **argv)
 {
-    unsigned long long max_bytes = (unsigned long long)DEFAULT_SAFE_MB * 1024ull * 1024ull;
-    size_t chunk = (size_t)DEFAULT_CHUNK_MB * 1024ull * 1024ull;
-    unsigned stagger_ms = 0;
-    unsigned quota_mb = 0;
-    int safe = 0;
-    int plot_only = 0;
-    int chunk_mb = 0;
+    unsigned requested_mb = DEFAULT_SOFT_MB;
+    unsigned chunk_mb = DEFAULT_CHUNK_MB;
+    unsigned stagger_ms = DEFAULT_STAGGER_MS;
+    unsigned effective_mb;
     int i;
     int rc;
 
     install_stop_handlers();
 
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-plot") == 0)
-            plot_only = 1;
-        else if (strcmp(argv[i], "-safe") == 0)
-            safe = 1;
-        else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            int mb = atoi(argv[++i]);
-            if (mb < 0)
-                mb = 0;
-            max_bytes = (unsigned long long)mb * 1024ull * 1024ull;
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            chunk_mb = atoi(argv[++i]);
-            if (chunk_mb < 1)
-                chunk_mb = 1;
-            chunk = (size_t)chunk_mb * 1024ull * 1024ull;
-        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-            int ms = atoi(argv[++i]);
-            if (ms < 0)
-                ms = 0;
-            stagger_ms = (unsigned)ms;
-        } else if (strcmp(argv[i], "-q") == 0 && i + 1 < argc) {
-            int mb = atoi(argv[++i]);
-            if (mb < 1)
-                mb = 1;
-            quota_mb = (unsigned)mb;
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(stdout);
+            return 0;
         }
+        if (strcmp(argv[i], "-safe") == 0) {
+            printf("Флаг -safe не нужен: безопасный режим и есть режим по умолчанию.\n");
+            continue;
+        }
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            if (parse_u(argv[++i], &requested_mb) != 0) {
+                fprintf(stderr, "Некорректное значение -m.\n");
+                usage(stderr);
+                return 1;
+            }
+            if (requested_mb == 0) {
+                fprintf(stderr, "-m 0 отклонено: безлимитный режим отключён. Потолок HARD_CAP = %u МиБ.\n",
+                        HARD_CAP_MB);
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            if (parse_u(argv[++i], &chunk_mb) != 0 || chunk_mb == 0) {
+                fprintf(stderr, "Некорректное значение -c (нужно целое число МиБ от 1).\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            if (parse_u(argv[++i], &stagger_ms) != 0) {
+                fprintf(stderr, "Некорректное значение -s.\n");
+                return 1;
+            }
+            continue;
+        }
+        fprintf(stderr, "Неизвестный аргумент: %s\n", argv[i]);
+        usage(stderr);
+        return 1;
     }
+
+    if (chunk_mb > HARD_CAP_MB)
+        chunk_mb = HARD_CAP_MB;
 
     g_page = page_size();
-    if (chunk % g_page)
-        chunk = (chunk / g_page + 1) * g_page;
+    effective_mb = clamp_effective(requested_mb);
+    if (effective_mb == 0)
+        return 1;
+    if (chunk_mb > effective_mb)
+        chunk_mb = effective_mb;
 
-    if (plot_only) {
-        const char *src;
-        if (NO_FILES)
-            return 1;
-        src = file_exists(CRASH_LOG) ? CRASH_LOG : NULL;
-        if (!src || load_csv(src) != 0)
-            return 1;
-        write_svg(CRASH_SVG);
-        return 0;
-    }
-
-    if (safe)
-        rc = run_safe(max_bytes, chunk, stagger_ms ? stagger_ms : DEFAULT_STAGGER_MS, quota_mb);
-    else
-        rc = run_crash(chunk_mb, stagger_ms, quota_mb);
-
+    print_banner(requested_mb, effective_mb, chunk_mb, stagger_ms);
+    rc = run_bounded(effective_mb, chunk_mb, stagger_ms);
     free(g_chunks);
+    g_chunks = NULL;
     return rc;
 }
